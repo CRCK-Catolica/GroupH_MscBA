@@ -1,0 +1,47 @@
+table,variable,description,unit
+customers,customer_record_id,Identifier associated with a customer record,
+customers,customer_id,Customer identifier,
+customers,postal_area,Postal-area identifier,
+customers,city,City identifier,
+customers,region,Broader geographical region,
+orders,order_id,Order identifier,
+orders,customer_record_id,Customer-record identifier associated with the order,
+orders,order_status,Recorded operational status of the order,
+orders,purchase_timestamp,Date and time at which the order was placed,datetime
+orders,approval_timestamp,Date and time at which the order was approved,datetime
+orders,carrier_timestamp,Date and time at which the order was transferred to a carrier,datetime
+orders,delivery_timestamp,Recorded date and time of delivery to the customer,datetime
+orders,estimated_delivery_timestamp,Estimated date and time of delivery,datetime
+order_items,order_id,Order identifier,
+order_items,item_number,Item sequence within an order,integer
+order_items,product_id,Product identifier,
+order_items,seller_id,Seller identifier,
+order_items,shipping_deadline,Operational shipping deadline associated with the item,datetime
+order_items,item_price,Recorded price of the item,Aurora Market currency units
+order_items,freight_cost,Recorded freight or shipping charge,Aurora Market currency units
+products,product_id,Product identifier,
+products,product_category,Product category,
+products,name_length,Length of the product listing name,characters
+products,description_length,Length of the product listing description,characters
+products,photo_count,Number of photographs associated with the product listing,count
+products,weight_g,Recorded product weight,grams
+products,length_cm,Recorded product length,centimetres
+products,height_cm,Recorded product height,centimetres
+products,width_cm,Recorded product width,centimetres
+sellers,seller_id,Seller identifier,
+sellers,postal_area,Seller postal-area identifier,
+sellers,city,Seller city identifier,
+sellers,region,Seller geographical region,
+payments,order_id,Order identifier,
+payments,payment_sequence,Sequence number associated with a payment record,integer
+payments,payment_method,Recorded payment method,
+payments,installments,Number of instalments associated with the payment,count
+payments,payment_amount,Recorded payment amount,Aurora Market currency units
+customer_feedback,feedback_id,Feedback identifier,
+customer_feedback,order_id,Order associated with the feedback,
+customer_feedback,rating,Numerical customer rating,rating scale
+customer_feedback,has_title,Indicates whether the feedback included a title,TRUE/FALSE
+customer_feedback,has_comment,Indicates whether written feedback was provided,TRUE/FALSE
+customer_feedback,comment_length,Length of the written feedback,characters
+customer_feedback,feedback_created_timestamp,Date and time at which the feedback record was created,datetime
+customer_feedback,feedback_answered_timestamp,Recorded date and time at which the feedback was answered,datetime
