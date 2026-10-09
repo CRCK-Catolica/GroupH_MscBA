@@ -1,0 +1,553 @@
+---
+title: "Aurora Market: Data Familiarization"
+subtitle: "FSAR 2026 · Group H · Scoping Brief, section 1.1"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 3.6, dpi = 120)
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(tidyr); library(stringr)
+  library(ggplot2); library(knitr)
+})
+options(dplyr.summarise.inform = FALSE)
+
+# ---- helpers ----------------------------------------------------------------
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+pct <- function(a, b) sprintf("%.2f%%", 100 * a / b)
+tbl <- function(df, n = 30, caption = NULL) {
+  df <- as.data.frame(df)
+  if (nrow(df) > n) caption <- paste0(c(caption, sprintf("(first %d of %d rows)", n, nrow(df))), collapse = " ")
+  kable(head(df, n), format.args = list(big.mark = ","), caption = caption, digits = 2)
+}
+profile_columns <- function(df) {
+  tibble(column = names(df),
+         type = vapply(df, function(x) class(x)[1], character(1)),
+         n_missing = vapply(df, function(x) sum(is.na(x)), integer(1)),
+         pct_missing = round(100 * n_missing / nrow(df), 2),
+         n_distinct = vapply(df, function(x) n_distinct(x, na.rm = TRUE), integer(1)),
+         example = vapply(df, function(x) as.character(x[which(!is.na(x))[1]]), character(1)))
+}
+numeric_summary <- function(df) {
+  df %>% select(where(is.numeric)) %>%
+    pivot_longer(everything(), names_to = "variable") %>%
+    group_by(variable) %>%
+    summarise(n_na = sum(is.na(value)), min = min(value, na.rm = TRUE),
+              p01 = quantile(value, .01, na.rm = TRUE), median = median(value, na.rm = TRUE),
+              mean = mean(value, na.rm = TRUE), p99 = quantile(value, .99, na.rm = TRUE),
+              max = max(value, na.rm = TRUE), n_zero = sum(value == 0, na.rm = TRUE),
+              n_neg = sum(value < 0, na.rm = TRUE))
+}
+freq <- function(df, ...) df %>% count(..., sort = TRUE) %>% mutate(pct = round(100 * n / sum(n), 2))
+key_info <- function(df, cols) {
+  n_keys <- nrow(distinct(df, across(all_of(cols))))
+  tibble(key = paste(cols, collapse = " + "), rows = nrow(df), distinct = n_keys,
+         extra_rows = nrow(df) - n_keys, unique = n_keys == nrow(df))
+}
+check_fk <- function(child, child_name, parent, parent_name, by) {
+  tibble(relationship = sprintf("%s.%s → %s", child_name, by, parent_name),
+         child_rows = nrow(child),
+         unmatched_rows = sum(!child[[by]] %in% parent[[by]]),
+         unmatched_keys = n_distinct(child[[by]][!child[[by]] %in% parent[[by]]]),
+         parents_without_child = sum(!unique(parent[[by]]) %in% child[[by]]))
+}
+
+# ---- chart style: one hue, recessive grid, ink-coloured text ----------------
+col_main <- "#2a78d6"; ink <- "#52514e"
+theme_set(theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour = "#e6e5e1", linewidth = 0.3),
+        axis.text = element_text(colour = ink), axis.title = element_text(colour = ink),
+        plot.title = element_text(face = "bold", size = 12), plot.title.position = "plot",
+        plot.subtitle = element_text(colour = ink)))
+```
+
+# Purpose and approach {.unnumbered}
+
+This document explores all seven Aurora Market tables before any cleaning. For each table we check its **dimensions and unit of observation**, **identifiers**, **missing values**, **duplicates**, **unusual numeric or categorical values**, and other **consistency issues**. We then look at **how the tables connect**. Nothing here modifies the data; every number is computed from the original CSV files in `Data/`.
+
+The same analysis is available as a console script in `R/02_data_familiarization.R`.
+
+# Loading the data
+
+Every column gets an explicit type. All `*_timestamp` columns and `shipping_deadline` are parsed as UTC date-times, as the README requires.
+
+```{r load}
+dt <- col_datetime(format = "")
+spec <- list(
+  customers = cols(.default = col_character()),
+  orders = cols(.default = col_character(),
+                purchase_timestamp = dt, approval_timestamp = dt, carrier_timestamp = dt,
+                delivery_timestamp = dt, estimated_delivery_timestamp = dt),
+  order_items = cols(.default = col_character(), item_number = col_integer(),
+                     shipping_deadline = dt, item_price = col_double(), freight_cost = col_double()),
+  products = cols(.default = col_double(), product_id = col_character(), product_category = col_character()),
+  sellers = cols(.default = col_character()),
+  payments = cols(.default = col_character(), payment_sequence = col_integer(),
+                  installments = col_integer(), payment_amount = col_double()),
+  customer_feedback = cols(.default = col_character(), rating = col_integer(),
+                           has_title = col_logical(), has_comment = col_logical(),
+                           comment_length = col_integer(),
+                           feedback_created_timestamp = dt, feedback_answered_timestamp = dt))
+
+d <- lapply(names(spec), function(t) read_csv(file.path("Data", paste0(t, ".csv")),
+                                              col_types = spec[[t]], na = c("", "NA")))
+names(d) <- names(spec)
+customers <- d$customers; orders <- d$orders; items <- d$order_items
+products <- d$products; sellers <- d$sellers; payments <- d$payments; feedback <- d$customer_feedback
+
+parse_issues <- vapply(d, function(x) nrow(problems(x)), integer(1))
+```
+
+Parsing problems across all tables: **`r sum(parse_issues)`**. Every value matched its declared type.
+
+# Overview of the seven tables
+
+```{r overview}
+overview <- tibble(
+  table = names(d),
+  rows = vapply(d, nrow, integer(1)),
+  columns = vapply(d, ncol, integer(1)),
+  cells_missing = vapply(d, function(x) sum(is.na(x)), integer(1)),
+  exact_duplicate_rows = vapply(d, function(x) sum(duplicated(x)), integer(1)),
+  unit_of_observation = c("customer record (one per order)", "order", "item line within an order",
+                          "product listing", "seller", "payment within an order", "feedback record"))
+tbl(overview)
+```
+
+The tables are at **different units of observation**. Only `orders` and `customers` share the same grain, and three tables (`order_items`, `payments`, `customer_feedback`) can have several rows per order.
+
+# customers
+
+```{r cust-structure}
+tbl(profile_columns(customers), caption = "Column profile")
+```
+
+## Identifiers
+
+```{r cust-keys}
+rec_per_cust <- customers %>% count(customer_id, name = "records")
+n_multi <- sum(rec_per_cust$records > 1)
+tbl(bind_rows(key_info(customers, "customer_record_id"), key_info(customers, "customer_id")))
+tbl(rec_per_cust %>% count(records, name = "customers") %>% mutate(pct = round(100 * customers / sum(customers), 2)),
+    caption = "Records per customer_id")
+```
+
+`customer_record_id` is unique, but **`customer_id` is not**. `r fmt(n_multi)` people (`r pct(n_multi, nrow(rec_per_cust))`) have more than one record, and one has `r max(rec_per_cust$records)`. As Section 4 shows, a *record* is created per order. Customer-level questions (repeat purchase, lifetime value) must therefore group by `customer_id`.
+
+```{r cust-location}
+loc <- customers %>% semi_join(filter(rec_per_cust, records > 1), by = "customer_id") %>%
+  group_by(customer_id) %>%
+  summarise(postal = n_distinct(postal_area), city = n_distinct(city), region = n_distinct(region))
+pa_city  <- customers %>% distinct(postal_area, city) %>% count(postal_area) %>% filter(n > 1)
+city_reg <- customers %>% distinct(city, region) %>% count(city) %>% filter(n > 1)
+```
+
+**Location is stored per record, not per person.** Of the `r fmt(nrow(loc))` repeat customers, `r sum(loc$postal > 1)` change postal area, `r sum(loc$city > 1)` change city and `r sum(loc$region > 1)` change region between records. It most likely reflects the delivery address of each order.
+
+**Geography hierarchy.** There are `r fmt(n_distinct(customers$postal_area))` postal areas, `r fmt(n_distinct(customers$city))` cities and `r n_distinct(customers$region)` regions. Each postal area maps to a single city (`r nrow(pa_city)` exceptions). However, **`r nrow(city_reg)` city identifiers appear in more than one region**, so city codes are not safe as a standalone geographic key.
+
+```{r cust-region}
+reg <- freq(customers, region)
+tbl(reg, n = 10, caption = "Customer records by region")
+```
+
+Customers are highly concentrated: `r reg$region[1]` alone holds **`r reg$pct[1]`%** of records, and the smallest regions have fewer than 100. Region-level estimates for small regions will be imprecise.
+
+# orders
+
+```{r ord-structure}
+tbl(profile_columns(orders), caption = "Column profile")
+tbl(bind_rows(key_info(orders, "order_id"), key_info(orders, "customer_record_id")))
+```
+
+Both `order_id` and `customer_record_id` are unique here. Orders and customer records are therefore **1:1**.
+
+## Order status and structured missingness
+
+```{r ord-status}
+miss_status <- orders %>% group_by(order_status) %>%
+  summarise(orders = n(), no_approval = sum(is.na(approval_timestamp)),
+            no_carrier = sum(is.na(carrier_timestamp)), no_delivery = sum(is.na(delivery_timestamp))) %>%
+  arrange(desc(orders)) %>% mutate(pct_orders = round(100 * orders / sum(orders), 2), .after = orders)
+tbl(miss_status)
+cmp_no_del <- sum(orders$order_status == "COMPLETED" & is.na(orders$delivery_timestamp))
+canc_del   <- sum(orders$order_status == "CANCELLED" & !is.na(orders$delivery_timestamp))
+```
+
+`r pct(sum(orders$order_status == "COMPLETED"), nrow(orders))` of orders are COMPLETED. Missing timestamps are **not random**: they follow the order status. An order that never shipped has no carrier or delivery date. Missing delivery dates are therefore meaningful information, not a cleaning problem to drop. There are small contradictions: `r cmp_no_del` COMPLETED orders have no delivery date, and `r canc_del` CANCELLED orders have one.
+
+## Time coverage
+
+```{r ord-time, fig.height = 3.2}
+monthly <- orders %>% count(month = as.Date(format(purchase_timestamp, "%Y-%m-01")))
+monthly <- tibble(month = seq(min(monthly$month), max(monthly$month), by = "month")) %>%
+  left_join(monthly, by = "month") %>% mutate(n = coalesce(n, 0L))
+thin <- monthly %>% filter(n < 100)
+ggplot(monthly, aes(month, n)) +
+  geom_col(fill = col_main, width = 25) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, .05))) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %y") +
+  labs(title = "Orders per month", subtitle = "Sparse first months and an abrupt end in Oct 2024",
+       x = NULL, y = "Orders")
+```
+
+Purchases run from `r format(min(orders$purchase_timestamp), "%d %b %Y")` to `r format(max(orders$purchase_timestamp), "%d %b %Y")`. Months with fewer than 100 orders: `r paste0(format(thin$month, "%b %Y"), " (", thin$n, ")", collapse = ", ")`. These edge months are not comparable to the rest and should probably be excluded from any trend or seasonal analysis. There is also a visible peak in December 2023.
+
+## Chronological consistency
+
+```{r ord-seq}
+seq_checks <- tibble(
+  check = c("approval before purchase", "carrier handover before approval",
+            "carrier handover before purchase", "delivery before carrier handover",
+            "delivery before purchase", "estimated delivery before purchase"),
+  orders = c(sum(orders$approval_timestamp < orders$purchase_timestamp, na.rm = TRUE),
+             sum(orders$carrier_timestamp < orders$approval_timestamp, na.rm = TRUE),
+             sum(orders$carrier_timestamp < orders$purchase_timestamp, na.rm = TRUE),
+             sum(orders$delivery_timestamp < orders$carrier_timestamp, na.rm = TRUE),
+             sum(orders$delivery_timestamp < orders$purchase_timestamp, na.rm = TRUE),
+             sum(orders$estimated_delivery_timestamp < orders$purchase_timestamp, na.rm = TRUE)))
+tbl(seq_checks)
+```
+
+The order lifecycle should run purchase → approval → carrier → delivery. **`r fmt(seq_checks$orders[2])` orders reach the carrier before approval** and `r seq_checks$orders[3]` before the purchase itself. This matters for any variable built from stage durations, such as "seller handling time".
+
+## Delivery performance
+
+```{r ord-delivery}
+del <- orders %>% filter(!is.na(delivery_timestamp)) %>%
+  mutate(delivery_days = as.numeric(difftime(delivery_timestamp, purchase_timestamp, units = "days")),
+         promised_days = as.numeric(difftime(estimated_delivery_timestamp, purchase_timestamp, units = "days")),
+         days_vs_estimate = as.numeric(difftime(delivery_timestamp, estimated_delivery_timestamp, units = "days")))
+late_time <- mean(del$days_vs_estimate > 0)
+late_date <- mean(as.Date(del$delivery_timestamp) > as.Date(del$estimated_delivery_timestamp))
+tbl(numeric_summary(select(del, delivery_days, promised_days, days_vs_estimate)))
+```
+
+```{r ord-delivery-plot, fig.height = 3.2}
+ggplot(del, aes(as.numeric(as.Date(delivery_timestamp) - as.Date(estimated_delivery_timestamp)))) +
+  geom_histogram(binwidth = 2, boundary = 0, fill = col_main, colour = "white", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = ink, linetype = "dashed") +
+  coord_cartesian(xlim = c(-50, 40)) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, .05))) +
+  annotate("text", x = 1, y = Inf, label = "late", hjust = 0, vjust = 1.5, colour = ink, size = 3.5) +
+  labs(title = "Delivery date minus estimated date (days)",
+       subtitle = "Most orders arrive well before the estimate; the late tail is small but long",
+       x = "Days (negative = early)", y = "Orders")
+```
+
+The median delivery takes **`r round(median(del$delivery_days), 1)` days**, against a median promise of `r round(median(del$promised_days), 1)` days. The estimate is always recorded at 00:00, so it is a *date*, while the actual delivery has a precise time. Comparing raw timestamps labels `r pct(late_time, 1)` of orders late. Comparing calendar dates gives **`r pct(late_date, 1)`**. A "late" variable should be built from dates.
+
+# order_items
+
+```{r it-structure}
+tbl(profile_columns(items), caption = "Column profile")
+```
+
+## Identifiers and duplicates
+
+```{r it-keys}
+n_exact <- sum(duplicated(items))
+dup_keys <- items %>% group_by(order_id, item_number) %>% filter(n() > 1) %>% ungroup()
+tbl(key_info(items, c("order_id", "item_number")))
+tbl(head(dup_keys, 4), caption = "Example of duplicated item lines")
+numbering <- items %>% distinct(order_id, item_number) %>% group_by(order_id) %>%
+  summarise(n = n(), mx = max(item_number), mn = min(item_number))
+```
+
+The intended key (`order_id`, `item_number`) is **not unique**. There are `r n_exact` exact duplicate rows, identical in every column. Section 8.2 shows that payments match the totals *without* these duplicates, so they are recording errors. Item numbers otherwise run 1…n with no gaps (`r sum(numbering$mx != numbering$n | numbering$mn != 1)` exceptions).
+
+## Order composition
+
+```{r it-composition}
+per_order <- items %>% distinct() %>% group_by(order_id) %>%
+  summarise(items = n(), products = n_distinct(product_id), sellers = n_distinct(seller_id))
+tbl(freq(per_order, items) %>% arrange(items), n = 8, caption = "Item lines per order")
+```
+
+`r pct(sum(per_order$items == 1), nrow(per_order))` of orders contain a single item. `r fmt(sum(per_order$sellers > 1))` orders (`r pct(sum(per_order$sellers > 1), nrow(per_order))`) involve more than one seller. In `r fmt(sum(per_order$items > per_order$products))` orders the same product appears on several lines. There is no quantity column; **quantity is represented by repeated lines**.
+
+## Prices, freight and shipping deadlines
+
+```{r it-prices}
+sd <- items %>% distinct() %>% left_join(select(orders, order_id, purchase_timestamp), by = "order_id") %>%
+  mutate(deadline_days = as.numeric(difftime(shipping_deadline, purchase_timestamp, units = "days")))
+tbl(numeric_summary(bind_cols(select(items %>% distinct(), item_price, freight_cost), select(sd, deadline_days))))
+```
+
+- Prices are **strongly right-skewed**: the median is `r round(median(items$item_price), 2)` and the maximum `r fmt(max(items$item_price))`. Log transformations or robust statistics will be needed.
+- `r fmt(sum(items$freight_cost == 0))` item lines have zero freight, and `r fmt(sum(items$freight_cost > items$item_price))` (`r pct(sum(items$freight_cost > items$item_price), nrow(items))`) have freight higher than the item price.
+- The shipping deadline is normally 2–19 days after purchase, but `r sum(sd$deadline_days > 30)` lines have deadlines over 30 days away, with a maximum of **`r round(max(sd$deadline_days))` days**. These are likely entry errors.
+
+# products
+
+```{r pr-structure}
+tbl(profile_columns(products), caption = "Column profile")
+tbl(key_info(products, "product_id"))
+```
+
+## Missing values come in one block
+
+```{r pr-missing}
+tbl(products %>%
+  transmute(category_missing = is.na(product_category),
+            listing_info_missing = is.na(name_length) & is.na(description_length) & is.na(photo_count),
+            dimensions_missing = is.na(weight_g) & is.na(length_cm) & is.na(height_cm) & is.na(width_cm)) %>%
+  count(category_missing, listing_info_missing, dimensions_missing))
+```
+
+The category, name length, description length and photo count are missing **together for the same `r sum(is.na(products$product_category))` products**. That is one missing-data pattern (listings created without metadata), not four separate problems. Only `r sum(is.na(products$weight_g))` products lack physical dimensions.
+
+## Category labels are inconsistently spelled
+
+```{r pr-categories}
+normalise_cat <- function(x) {
+  x %>% toupper() %>% str_replace_all("[^A-Z]+", "_") %>% str_replace_all("_+", "_") %>%
+    str_replace_all("^_|_$", "") %>% str_replace("^HOUSEHOLDGOODS$", "HOUSEHOLD_GOODS")
+}
+cat_map <- products %>% filter(!is.na(product_category)) %>% distinct(product_category) %>%
+  mutate(normalised = normalise_cat(product_category))
+tbl(cat_map %>% group_by(normalised) %>% filter(n() > 1) %>% arrange(normalised) %>%
+      left_join(count(products, product_category, name = "products"), by = "product_category"),
+    caption = "Labels that refer to the same category")
+```
+
+There are **`r nrow(cat_map)` raw labels but only `r n_distinct(cat_map$normalised)` real categories**. Five categories also appear in variant spellings: lowercase, hyphens, spaces, doubled or missing underscores. Each variant holds exactly 24 products, which suggests they were introduced deliberately and must be harmonised before any category analysis.
+
+```{r pr-cat-dist}
+tbl(products %>% mutate(category = normalise_cat(product_category)) %>% freq(category), n = 10,
+    caption = "Top categories after harmonising")
+```
+
+## Physical attributes
+
+```{r pr-numeric}
+tbl(numeric_summary(select(products, -product_id, -product_category)))
+tbl(products %>% arrange(desc(weight_g)) %>%
+      mutate(volume_litres = length_cm * height_cm * width_cm / 1000) %>%
+      select(product_id, product_category, weight_g, length_cm, height_cm, width_cm, volume_litres) %>% head(8),
+    caption = "Heaviest products")
+big <- sum(products$weight_g > 100000, na.rm = TRUE)
+```
+
+`weight_g` contains `r sum(products$weight_g == 0, na.rm = TRUE)` zero weights. It also contains **`r big` products over 100 kg packed in boxes no larger than about 55 cm per side**, the heaviest at 9,375,000 g (9.4 tonnes). The 99.9th percentile is only `r fmt(quantile(products$weight_g, .999, na.rm = TRUE))` g, so these are almost certainly entry errors. They would dominate any analysis of weight and freight.
+
+# sellers
+
+```{r se-structure}
+tbl(profile_columns(sellers), caption = "Column profile")
+tbl(key_info(sellers, "seller_id"))
+sreg <- freq(sellers, region)
+tbl(sreg, n = 8, caption = "Sellers by region")
+```
+
+`seller_id` is unique. Sellers are even more concentrated than customers: `r sreg$region[1]` hosts **`r sreg$pct[1]`%** of them. All `r n_distinct(sellers$region)` seller regions also appear among the `r n_distinct(customers$region)` customer regions.
+
+```{r se-activity}
+seller_act <- items %>% distinct() %>% group_by(seller_id) %>%
+  summarise(item_lines = n(), orders = n_distinct(order_id), revenue = sum(item_price))
+top10 <- seller_act %>% arrange(desc(revenue)) %>% slice(1:ceiling(n() * 0.1))
+tbl(numeric_summary(select(seller_act, item_lines, orders, revenue)), caption = "Activity per seller")
+```
+
+Seller activity has a very long tail. The top 10% of sellers generate **`r round(100 * sum(top10$revenue) / sum(seller_act$revenue), 1)`%** of item revenue, while `r fmt(sum(seller_act$orders == 1))` sellers (`r pct(sum(seller_act$orders == 1), nrow(seller_act))`) have a single order. Seller-level estimates for small sellers will be noisy.
+
+# payments
+
+```{r pa-structure}
+tbl(profile_columns(payments), caption = "Column profile")
+tbl(bind_rows(key_info(payments, "order_id"), key_info(payments, c("order_id", "payment_sequence"))))
+pay_per_order <- payments %>% count(order_id, name = "payments")
+```
+
+The key is (`order_id`, `payment_sequence`). `r pct(sum(pay_per_order$payments > 1), nrow(pay_per_order))` of orders are split over several payments, up to `r max(pay_per_order$payments)`, so **payments must be summed per order** before joining.
+
+## Methods, instalments and amounts
+
+```{r pa-methods}
+tbl(payments %>% group_by(payment_method) %>%
+      summarise(payments = n(), pct = round(100 * n() / nrow(payments), 2),
+                min_inst = min(installments), mean_inst = mean(installments), max_inst = max(installments),
+                zero_amount = sum(payment_amount == 0)) %>% arrange(desc(payments)))
+tbl(numeric_summary(select(payments, installments, payment_amount)))
+```
+
+Only CARD payments use instalments. Small anomalies: `r sum(payments$installments == 0)` payments with **0 instalments**, `r sum(payments$payment_amount == 0)` with **amount 0**, and `r sum(payments$payment_method == "UNKNOWN")` with method **UNKNOWN**.
+
+## Do payments add up to item price + freight?
+
+```{r pa-recon}
+paid <- payments %>% group_by(order_id) %>% summarise(paid = sum(payment_amount))
+due  <- items %>% distinct() %>% group_by(order_id) %>% summarise(due = sum(item_price + freight_cost))
+due_raw <- items %>% group_by(order_id) %>% summarise(due_raw = sum(item_price + freight_cost))
+recon <- inner_join(paid, due, by = "order_id") %>% left_join(due_raw, by = "order_id") %>%
+  mutate(diff = paid - due, diff_raw = paid - due_raw)
+
+dup_orders <- items %>% filter(duplicated(items)) %>% distinct(order_id)
+rd <- recon %>% semi_join(dup_orders, by = "order_id")
+tbl(tibble(orders_with_duplicate_item_rows = nrow(rd),
+           payment_matches_deduplicated_total = sum(abs(rd$diff) <= 1),
+           payment_matches_raw_total = sum(abs(rd$diff_raw) <= 1)),
+    caption = "Which total do payments match for orders with duplicated item rows?")
+
+mism <- recon %>% filter(abs(diff) > 1) %>% mutate(ratio = paid / due) %>%
+  left_join(payments %>% group_by(order_id) %>% summarise(max_inst = max(installments)), by = "order_id")
+tbl(mism %>% mutate(ratio_band = cut(ratio, c(0, 0.9, 0.99, 1.1, 2, 9.99, 10.01, Inf),
+                                     labels = c("<0.90", "0.90-0.99", "1.01-1.10", "1.10-2", "2-9.99",
+                                                "exactly 10x", ">10x"))) %>%
+      group_by(ratio_band) %>%
+      summarise(orders = n(), share_card_with_instalments = mean(max_inst > 1)),
+    caption = "Orders where paid ≠ due (by more than 1 unit), by paid/due ratio")
+ten_x <- sum(abs(mism$ratio - 10) < 0.01)
+```
+
+- **Payments match item + freight for `r pct(sum(abs(recon$diff) <= 1), nrow(recon))` of orders** once duplicate item rows are removed. For every order with a duplicated item row, the payment matches the de-duplicated total and never the raw one. This confirms the duplicates are errors.
+- **`r ten_x` orders were paid exactly 10× the amount due**, a likely decimal-point error.
+- Most other overpayments (1–100% above the total) are on card payments with instalments. That is consistent with instalment interest, so they are probably legitimate.
+
+# customer_feedback
+
+```{r fb-structure}
+tbl(profile_columns(feedback), caption = "Column profile")
+tbl(bind_rows(key_info(feedback, "feedback_id"), key_info(feedback, "order_id"),
+              key_info(feedback, c("feedback_id", "order_id"))))
+```
+
+## Feedback and orders are many-to-many
+
+```{r fb-keys}
+fid_multi <- feedback %>% group_by(feedback_id) %>% filter(n() > 1) %>%
+  summarise(rows = n(), orders = n_distinct(order_id), ratings = n_distinct(rating))
+oid_multi <- feedback %>% group_by(order_id) %>% filter(n() > 1) %>%
+  summarise(rows = n(), ratings = n_distinct(rating))
+```
+
+Neither `feedback_id` nor `order_id` is unique on its own; only the pair is.
+
+- `r nrow(fid_multi)` feedback IDs appear on several rows. They always point to *different* orders with the *same* rating, so one feedback can cover several orders.
+- **`r nrow(oid_multi)` orders have more than one feedback record, and `r sum(oid_multi$ratings > 1)` of them have conflicting ratings.** Before joining ratings to orders we need a rule, for example keeping the latest record or the average.
+
+## Ratings
+
+```{r fb-rating, fig.height = 3}
+rating_status <- feedback %>% left_join(select(orders, order_id, order_status), by = "order_id") %>%
+  group_by(order_status) %>%
+  summarise(feedback = n(), mean_rating = mean(rating), pct_rating_1_2 = 100 * mean(rating <= 2)) %>%
+  arrange(desc(feedback))
+ggplot(count(feedback, rating), aes(factor(rating), n)) +
+  geom_col(fill = col_main, width = 0.6) +
+  geom_text(aes(label = scales::percent(n / sum(n), accuracy = 0.1)), vjust = -0.4, colour = ink, size = 3.5) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, .12))) +
+  labs(title = "Distribution of ratings", subtitle = "J-shaped: mostly 5s, with a second peak at 1",
+       x = "Rating", y = "Feedback records")
+tbl(rating_status, caption = "Ratings by status of the reviewed order")
+```
+
+The mean rating (`r round(mean(feedback$rating), 2)`) hides a **J-shaped distribution**. Rating is better treated as ordinal, or as a binary "low rating" (1–2), than as a normally distributed continuous outcome. Fulfilment is strongly linked to satisfaction: completed orders average `r round(rating_status$mean_rating[rating_status$order_status == "COMPLETED"], 2)`, and every other status averages 2.5 or less.
+
+## Text indicators
+
+```{r fb-text}
+tbl(count(feedback, has_comment, comment_length_positive = comment_length > 0), caption = "has_comment vs comment_length")
+tbl(feedback %>% group_by(rating) %>%
+      summarise(n = n(), pct_with_comment = 100 * mean(has_comment), mean_comment_length = mean(comment_length)),
+    caption = "Comments by rating")
+```
+
+`has_comment` is fully consistent with `comment_length`. Unhappy customers write much more often: about three quarters of 1-star ratings carry a comment, against about a third of 4–5-star ratings.
+
+## Timing
+
+```{r fb-timing}
+fbo <- feedback %>% left_join(select(orders, order_id, purchase_timestamp, delivery_timestamp), by = "order_id") %>%
+  mutate(answer_days = as.numeric(difftime(feedback_answered_timestamp, feedback_created_timestamp, units = "days")))
+tbl(feedback %>% count(time_of_day = format(feedback_created_timestamp, "%H:%M:%S"),
+                       month = format(feedback_created_timestamp, "%m")) %>%
+      group_by(time_of_day) %>% summarise(records = sum(n), months = paste(unique(month), collapse = ", ")),
+    caption = "Time of day of feedback creation")
+before_purchase <- sum(as.Date(fbo$feedback_created_timestamp) < as.Date(fbo$purchase_timestamp), na.rm = TRUE)
+before_delivery <- sum(as.Date(fbo$feedback_created_timestamp) < as.Date(fbo$delivery_timestamp), na.rm = TRUE)
+tbl(numeric_summary(select(fbo, answer_days)), caption = "Days from feedback creation to answer")
+```
+
+- Feedback creation is recorded as a **date**. `r sum(format(feedback$feedback_created_timestamp, "%H") == "01")` records show 01:00, all in the same month, which looks like a timezone or DST artifact.
+- **`r before_purchase` feedback records are dated before the purchase**, which is impossible.
+- `r fmt(before_delivery)` (`r pct(before_delivery, nrow(fbo))`) are dated before delivery. These may be complaints about late orders, which matters for any "delay → rating" analysis.
+- Feedback is answered after a median of `r round(median(fbo$answer_days), 1)` days, with a maximum of `r round(max(fbo$answer_days))` days.
+
+# Relationships and join behaviour
+
+## Referential integrity
+
+```{r rel-fk}
+fk <- bind_rows(
+  check_fk(orders,   "orders",      customers, "customers", "customer_record_id"),
+  check_fk(items,    "order_items", orders,    "orders",    "order_id"),
+  check_fk(items,    "order_items", products,  "products",  "product_id"),
+  check_fk(items,    "order_items", sellers,   "sellers",   "seller_id"),
+  check_fk(payments, "payments",    orders,    "orders",    "order_id"),
+  check_fk(feedback, "customer_feedback", orders, "orders", "order_id"))
+tbl(fk)
+```
+
+*`unmatched_rows`* are child rows that would be lost in an inner join. *`parents_without_child`* are parent keys with no matching child row. **`r fk$unmatched_keys[3]` product IDs are sold but missing from `products`.** Every other foreign key resolves.
+
+```{r rel-coverage}
+tbl(orders %>% mutate(has_items = order_id %in% items$order_id, has_payment = order_id %in% payments$order_id,
+                      has_feedback = order_id %in% feedback$order_id) %>%
+      group_by(order_status) %>%
+      summarise(orders = n(), no_items = sum(!has_items), no_payment = sum(!has_payment),
+                no_feedback = sum(!has_feedback)) %>% arrange(desc(orders)),
+    caption = "Orders without matching child rows, by status")
+```
+
+Orders without items are almost entirely UNAVAILABLE or CANCELLED. One completed order has no payment record, and `r sum(!orders$order_id %in% feedback$order_id)` orders have no feedback. An inner join to feedback would therefore silently drop them, and that is a possible selection issue.
+
+## Cardinality and fan-out
+
+```{r rel-card}
+card <- function(x, key) { k <- count(x, .data[[key]]); tibble(min = min(k$n), mean = mean(k$n), max = max(k$n)) }
+tbl(bind_rows(
+  tibble(join = "customer_record_id in customers") %>% bind_cols(card(customers, "customer_record_id")),
+  tibble(join = "customer_id in customers") %>% bind_cols(card(customers, "customer_id")),
+  tibble(join = "order_id in order_items") %>% bind_cols(card(items, "order_id")),
+  tibble(join = "order_id in payments") %>% bind_cols(card(payments, "order_id")),
+  tibble(join = "order_id in customer_feedback") %>% bind_cols(card(feedback, "order_id")),
+  tibble(join = "product_id in order_items") %>% bind_cols(card(items, "product_id")),
+  tibble(join = "seller_id in order_items") %>% bind_cols(card(items, "seller_id"))),
+  caption = "Rows per key value")
+
+j1 <- orders %>% left_join(items, by = "order_id", relationship = "many-to-many")
+j2 <- j1 %>% left_join(payments, by = "order_id", relationship = "many-to-many")
+j3 <- j2 %>% left_join(feedback, by = "order_id", relationship = "many-to-many")
+naive_rev <- sum(j3$payment_amount, na.rm = TRUE); true_rev <- sum(payments$payment_amount)
+tbl(tibble(step = c("orders", "+ order_items", "+ payments", "+ customer_feedback"),
+           rows = c(nrow(orders), nrow(j1), nrow(j2), nrow(j3)),
+           distinct_orders = c(n_distinct(orders$order_id), n_distinct(j1$order_id),
+                               n_distinct(j2$order_id), n_distinct(j3$order_id))),
+    caption = "Naive join of the order-level tables")
+```
+
+Joining the tables directly multiplies rows. `r fmt(nrow(orders))` orders become `r fmt(nrow(j3))` rows, and **summing `payment_amount` afterwards overstates revenue by `r pct(naive_rev - true_rev, true_rev)`** (`r fmt(round(naive_rev))` vs `r fmt(round(true_rev))`). Each table must be aggregated to the chosen unit of observation *before* joining.
+
+# Key findings
+
+1.  **Different units of observation.** `order_items`, `payments` and `customer_feedback` all have several rows per order. Naive joins inflate payment totals by `r pct(naive_rev - true_rev, true_rev)`.
+2.  **Customer identity.** `customer_record_id` is one record per order. The real person is `customer_id`, and `r pct(n_multi, nrow(rec_per_cust))` of people have several records.
+3.  **Duplicate item lines.** There are `r n_exact` exact duplicates in `order_items`, which payments confirm are errors.
+4.  **Category labels.** There are `r nrow(cat_map)` raw labels for `r n_distinct(cat_map$normalised)` real categories, and `r sum(is.na(products$product_category))` products have no category or listing metadata.
+5.  **Implausible product weights.** There are `r big` values over 100 kg in small boxes (up to 9.4 t), plus `r sum(products$weight_g == 0, na.rm = TRUE)` zero weights.
+6.  **Order timeline.** `r fmt(seq_checks$orders[2])` orders reach the carrier before approval, and delivery estimates are dates rather than date-times (`r pct(late_date, 1)` late by date).
+7.  **Payments mostly reconcile** (`r pct(sum(abs(recon$diff) <= 1), nrow(recon))`). `r ten_x` orders were paid exactly 10× the amount due, and there are small anomalies (0 instalments, 0 amounts, UNKNOWN method).
+8.  **Feedback is many-to-many with orders.** `r sum(oid_multi$ratings > 1)` orders carry conflicting ratings, and `r before_purchase` feedback records predate the purchase.
+9.  **Ratings are J-shaped and strongly related to fulfilment status**, so they suit ordinal or binary modelling.
+10. **Coverage gaps.** `r sum(!orders$order_id %in% items$order_id)` orders have no items, `r length(setdiff(unique(items$product_id), products$product_id))` sold products are missing from `products`, and the first and last months are sparse.
